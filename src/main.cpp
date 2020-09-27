@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -22,8 +24,48 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <glm/glm.hpp>
+
+const size_t MAX_FRAMES_IN_FLIGHT = 2;
+
 const uint32_t WWIDTH = 800;
 const uint32_t WHEIGHT = 600;
+
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    static VkVertexInputBindingDescription getBendingDescription() {
+        VkVertexInputBindingDescription description{};
+
+        description.binding = 0;
+        description.stride = sizeof(Vertex);
+        description.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return description;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 2>
+    getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 2> descriptions{};
+
+        descriptions[0].binding = 0;
+        descriptions[0].location = 0;
+        descriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        descriptions[0].offset = offsetof(Vertex, pos);
+
+        descriptions[1].binding = 0;
+        descriptions[1].location = 1;
+        descriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        descriptions[1].offset = offsetof(Vertex, color);
+
+        return descriptions;
+    }
+};
+
+const std::vector<Vertex> vertices = {{{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+                                      {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+                                      {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}};
 
 const std::vector<char *> validationLayers = {
     "VK_LAYER_KHRONOS_validation",
@@ -170,18 +212,33 @@ class TriangleApp {
 
     std::vector<VkFramebuffer> swapChainFramebuffers;
 
-    VkSemaphore semImageAvailable;
-    VkSemaphore semRenderFinished;
+    std::vector<VkSemaphore> imageAvailableSemaphores;
+    std::vector<VkSemaphore> renderFinishedSemaphores;
+    std::vector<VkFence> inFlightFences;
+    std::vector<VkFence> imagesInFlight;
+
+    size_t currentFrame = 0;
+
+    bool framebufferResized = false;
+
+    VkBuffer vertexBuffer;
+    VkDeviceMemory vertexBufferMemory;
 
     void initWindow() {
         std::cout << "Initializing window" << std::endl;
         glfwInit();
 
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
         w = glfwCreateWindow(800, 600, "Vulkan triangle", nullptr, nullptr);
+        if (w == NULL) {
+            throw std::runtime_error("Failed to create glfw window");
+        }
+
+        glfwSetWindowUserPointer(w, this);
         glfwSetKeyCallback(w, escKeyCallback);
+        glfwSetFramebufferSizeCallback(w, framebufferCallback);
     }
 
     void initVulkan() {
@@ -197,8 +254,9 @@ class TriangleApp {
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
+        createVertexBuffer();
         createCommandBuffers();
-        createSemaphores();
+        createSyncObjects();
     }
 
     void mainLoop() {
@@ -212,16 +270,38 @@ class TriangleApp {
 #endif
             glfwPollEvents();
         }
+        vkDeviceWaitIdle(device);
     }
 
     void cleanup() {
         std::cout << "Cleaning up objects" << std::endl;
 
-        vkDestroySemaphore(device, semImageAvailable, nullptr);
-        vkDestroySemaphore(device, semRenderFinished, nullptr);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
+            vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
+            vkDestroyFence(device, inFlightFences[i], nullptr);
+        }
 
         vkDestroyCommandPool(device, commandPool, nullptr);
 
+        cleanupSwapChain();
+
+        vkDestroyBuffer(device, vertexBuffer, nullptr);
+        vkFreeMemory(device, vertexBufferMemory, nullptr);
+        vkDestroyDevice(device, nullptr);
+
+        if (enableValidationLayers) {
+            DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
+        }
+
+        vkDestroySurfaceKHR(instance, surface, nullptr);
+        vkDestroyInstance(instance, nullptr);
+
+        glfwDestroyWindow(w);
+        glfwTerminate();
+    }
+
+    void cleanupSwapChain() {
         for (auto framebuffer : swapChainFramebuffers) {
             vkDestroyFramebuffer(device, framebuffer, nullptr);
         }
@@ -235,17 +315,6 @@ class TriangleApp {
         }
 
         vkDestroySwapchainKHR(device, swapChain, nullptr);
-        vkDestroyDevice(device, nullptr);
-
-        if (enableValidationLayers) {
-            DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
-        }
-
-        vkDestroySurfaceKHR(instance, surface, nullptr);
-        vkDestroyInstance(instance, nullptr);
-
-        glfwDestroyWindow(w);
-        glfwTerminate();
     }
 
     void createInstance() {
@@ -397,13 +466,24 @@ class TriangleApp {
         VkPipelineShaderStageCreateInfo shaderStages[] = {vertexCreateInfo,
                                                           fragmentCreateInfo};
 
+        auto bindingDescription = Vertex::getBendingDescription();
+        auto attributeDescription = Vertex::getAttributeDescriptions();
+
         VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
         vertexInputInfo.sType =
             VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount = 0;
-        vertexInputInfo.pVertexBindingDescriptions = nullptr;  // Optional
-        vertexInputInfo.vertexAttributeDescriptionCount = 0;
-        vertexInputInfo.pVertexAttributeDescriptions = nullptr;  // Optional
+        //vertexInputInfo.vertexBindingDescriptionCount = 0;
+        //vertexInputInfo.pVertexBindingDescriptions = nullptr;  // Optional
+        //vertexInputInfo.vertexAttributeDescriptionCount = 0;
+        //vertexInputInfo.pVertexAttributeDescriptions = nullptr;  // Optional
+
+        vertexInputInfo.vertexBindingDescriptionCount = 1;
+        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+
+        vertexInputInfo.vertexAttributeDescriptionCount =
+            static_cast<uint32_t>(attributeDescription.size());
+        vertexInputInfo.pVertexAttributeDescriptions =
+            attributeDescription.data();
 
         VkPipelineInputAssemblyStateCreateInfo assemblyCreateInfo{};
         assemblyCreateInfo.sType =
@@ -517,7 +597,6 @@ class TriangleApp {
 
         pipelineCreateInfo.basePipelineHandle = VK_NULL_HANDLE;
         pipelineCreateInfo.basePipelineIndex = -1;
-        
 
         std::cout << "Creating graphics pipeline" << std::endl;
         state = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
@@ -563,7 +642,7 @@ class TriangleApp {
         VkSubpassDependency subpassDep{};
         subpassDep.srcSubpass = VK_SUBPASS_EXTERNAL;
         subpassDep.dstSubpass = 0;
-        
+
         subpassDep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         subpassDep.srcAccessMask = 0;
 
@@ -583,7 +662,7 @@ class TriangleApp {
     void createFramebuffers() {
         swapChainFramebuffers.resize(swapChainImageViews.size());
 
-        for (size_t i = 0; i < swapChainFramebuffers.size(); i++) {
+        for (size_t i = 0; i < swapChainImageViews.size(); i++) {
             VkFramebufferCreateInfo framebufferInfo{};
             framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             framebufferInfo.renderPass = renderPass;
@@ -593,24 +672,25 @@ class TriangleApp {
             framebufferInfo.height = swapChainExtent.height;
             framebufferInfo.layers = 1;
 
-            auto state = vkCreateFramebuffer(device, &framebufferInfo, nullptr, &(swapChainFramebuffers[i]));
+            auto state = vkCreateFramebuffer(device, &framebufferInfo, nullptr,
+                                             &(swapChainFramebuffers[i]));
 
             if (state != VK_SUCCESS) {
                 throw std::runtime_error("Failed to create framebuffer");
             }
-
         }
     }
 
     void createCommandPool() {
         QueueFamiliesIndices indices = findQueueFamilies(physicalDevice);
-        
+
         VkCommandPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.queueFamilyIndex = indices.graphicsFamily.value();
         poolInfo.flags = 0;
 
-        auto state = vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool);
+        auto state =
+            vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool);
 
         if (state != VK_SUCCESS) {
             throw std::runtime_error("Failed to create command pool");
@@ -624,9 +704,10 @@ class TriangleApp {
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.commandPool = commandPool;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = (uint32_t) commandBuffers.size();
+        allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
 
-        auto state = vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data());
+        auto state =
+            vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data());
 
         if (state != VK_SUCCESS) {
             throw std::runtime_error("Failed to allocate command buffers");
@@ -637,11 +718,12 @@ class TriangleApp {
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.flags = 0;
             beginInfo.pInheritanceInfo = nullptr;
-            
+
             state = vkBeginCommandBuffer(commandBuffers[i], &beginInfo);
 
             if (state != VK_SUCCESS) {
-                throw std::runtime_error("Failed to begin recording command buffer");
+                throw std::runtime_error(
+                    "Failed to begin recording command buffer");
             }
 
             VkRenderPassBeginInfo renderBeginInfo{};
@@ -655,11 +737,19 @@ class TriangleApp {
 
             renderBeginInfo.clearValueCount = 1;
             renderBeginInfo.pClearValues = &colorClear;
-            vkCmdBeginRenderPass(commandBuffers[i], &renderBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBeginRenderPass(commandBuffers[i], &renderBeginInfo,
+                                 VK_SUBPASS_CONTENTS_INLINE);
 
-            vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+            vkCmdBindPipeline(commandBuffers[i],
+                              VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              graphicsPipeline);
 
-            vkCmdDraw(commandBuffers[i], 3, 1, 0, 0);
+            VkBuffer vertexBuffers[] = {vertexBuffer};
+            VkDeviceSize offsets[] = {0};
+
+            vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
+
+            vkCmdDraw(commandBuffers[i], static_cast<uint32_t>(vertices.size()), 1, 0, 0);
             vkCmdEndRenderPass(commandBuffers[i]);
 
             state = vkEndCommandBuffer(commandBuffers[i]);
@@ -670,39 +760,103 @@ class TriangleApp {
         }
     }
 
-    void createSemaphores() {
+    void createSyncObjects() {
+        imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+        imagesInFlight.resize(swapChainImages.size(), VK_NULL_HANDLE);
+
         VkSemaphoreCreateInfo semaphoreInfo{};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        auto stateImage = vkCreateSemaphore(device, &semaphoreInfo, nullptr, &semImageAvailable);
-        auto stateRender = vkCreateSemaphore(device, &semaphoreInfo, nullptr, &semRenderFinished);
 
-        if (stateImage != VK_SUCCESS || stateRender != VK_SUCCESS) {
-            throw std::runtime_error("Faioled to create shamphores");
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            auto stateImage = vkCreateSemaphore(device, &semaphoreInfo, nullptr,
+                                                &imageAvailableSemaphores[i]);
+            auto stateRender = vkCreateSemaphore(
+                device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]);
+            auto stateFence =
+                vkCreateFence(device, &fenceInfo, nullptr, &inFlightFences[i]);
+            if (stateImage != VK_SUCCESS || stateRender != VK_SUCCESS ||
+                stateFence != VK_SUCCESS) {
+                throw std::runtime_error("Faioled to sync objects for a frame");
+            }
         }
     }
 
-    void drawFrame() {
-        uint32_t imageIndex; 
-        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, semImageAvailable, VK_NULL_HANDLE, &imageIndex);
+    void createVertexBuffer() {
+        VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
         
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void *data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+
+        // copy data to buffer
+        memcpy(data, vertices.data(), (size_t) bufferSize);
+
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
+
+        copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void drawFrame() {
+        vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE,
+                        UINT64_MAX);
+
+        uint32_t imageIndex;
+        auto state =
+            vkAcquireNextImageKHR(device, swapChain, UINT64_MAX,
+                                  imageAvailableSemaphores[currentFrame],
+                                  VK_NULL_HANDLE, &imageIndex);
+
+        if (state == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreateSwapChain();
+            return;
+        }
+
+        if (!(state == VK_SUCCESS || state == VK_SUBOPTIMAL_KHR)) {
+            throw std::runtime_error("Failed to acquire image from sawp chain");
+        }
+
+        if (imagesInFlight[imageIndex] != VK_NULL_HANDLE) {
+            vkWaitForFences(device, 1, &imagesInFlight[imageIndex], VK_TRUE,
+                            UINT64_MAX);
+        }
+        imagesInFlight[imageIndex] = inFlightFences[currentFrame];
+
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
-        VkSemaphore waitSemaphores[] = {semImageAvailable};
+        VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};
 
-        VkPipelineStageFlags stageFlags[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+        VkPipelineStageFlags stageFlags[] = {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
         submitInfo.waitSemaphoreCount = 1;
         submitInfo.pWaitSemaphores = waitSemaphores;
         submitInfo.pWaitDstStageMask = stageFlags;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffers[imageIndex];
 
-        VkSemaphore signalSemaphores[] = {semRenderFinished};
+        VkSemaphore signalSemaphores[] = {
+            renderFinishedSemaphores[currentFrame]};
 
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = signalSemaphores;
 
-        auto state = vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkResetFences(device, 1, &inFlightFences[currentFrame]);
+        state = vkQueueSubmit(graphicsQueue, 1, &submitInfo,
+                              inFlightFences[currentFrame]);
 
         if (state != VK_SUCCESS) {
             throw std::runtime_error("Failed to submit graphics queue");
@@ -720,8 +874,19 @@ class TriangleApp {
         presentInfo.pImageIndices = &imageIndex;
 
         presentInfo.pResults = nullptr;
-        
-        vkQueuePresentKHR(graphicsQueue, &presentInfo);
+
+        state = vkQueuePresentKHR(presentQueue, &presentInfo);
+
+        if (state == VK_ERROR_OUT_OF_DATE_KHR || state == VK_SUBOPTIMAL_KHR ||
+            framebufferResized) {
+            framebufferResized = false;
+            recreateSwapChain();
+        } else if (state != VK_SUCCESS) {
+            throw std::runtime_error("Failed to present swapchain image");
+        }
+
+        vkQueueWaitIdle(presentQueue);
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     static VKAPI_ATTR VkBool32 VKAPI_CALL
@@ -883,14 +1048,72 @@ class TriangleApp {
         }
     }
 
+    void recreateSwapChain() {
+        int width = 0;
+        int height = 0;
+        glfwGetFramebufferSize(w, &width, &height);
+
+        while (width == 0 || height == 0) {
+            glfwGetFramebufferSize(w, &width, &height);
+            glfwWaitEvents();
+        }
+
+        vkDeviceWaitIdle(device);
+
+        cleanupSwapChain();
+
+        createSwapChain();
+        createImageViews();
+        createRenderPass();
+        createGraphicsPipeline();
+        createFramebuffers();
+        createCommandBuffers();
+    }
+
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags bufferUsage, VkMemoryPropertyFlags properties, VkBuffer &buffer, VkDeviceMemory &bufferMemory) {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = size;
+        bufferInfo.usage = bufferUsage;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        auto state =
+            vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
+
+        if (state != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create vertex buffer");
+        }
+
+        VkMemoryRequirements memReq;
+        vkGetBufferMemoryRequirements(device, buffer, &memReq);
+
+        VkMemoryAllocateInfo mallocInfo{};
+        mallocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mallocInfo.allocationSize = memReq.size;
+        mallocInfo.memoryTypeIndex = findMemoryType(memReq.memoryTypeBits, properties);
+
+        state = vkAllocateMemory(device, &mallocInfo, nullptr, &bufferMemory);
+        if (state != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate memory for vertex buffer");
+        }
+
+        vkBindBufferMemory(device, buffer, bufferMemory, 0);
+    }
+
     static void escKeyCallback(GLFWwindow *w, int key, int scancode, int action,
                                int mods) {
-        auto keyName = glfwGetKeyName(key, 0) != NULL ? glfwGetKeyName(key, 0) : "no printable key";
-        std::cout << "Key event detected " << key << " "<< keyName << std::endl;
+        auto keyName = glfwGetKeyName(key, 0) != NULL ? glfwGetKeyName(key, 0)
+                                                      : "no printable key";
+        std::cout << "Key event detected " << key << " " << keyName
+                  << std::endl;
         if (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q) {
             glfwSetWindowShouldClose(w, 1);
         }
-        // glfwSetWindowShouldClose(w, 1);
+    }
+
+    static void framebufferCallback(GLFWwindow *w, int width, int height) {
+        auto app = reinterpret_cast<TriangleApp *>(glfwGetWindowUserPointer(w));
+        app->framebufferResized = true;
     }
 
     QueueFamiliesIndices findQueueFamilies(VkPhysicalDevice device) {
@@ -1020,12 +1243,17 @@ class TriangleApp {
         return VK_PRESENT_MODE_FIFO_KHR;
     }
 
-    static VkExtent2D chooseSwapExtent(
-        const VkSurfaceCapabilitiesKHR &capabilities) {
+    VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities) {
         std::cout << "Choosing extent" << std::endl;
         if (capabilities.currentExtent.width != UINT32_MAX) {
             return capabilities.currentExtent;
         }
+
+        int width;
+        int height;
+
+        glfwGetFramebufferSize(w, &width, &height);
+
         VkExtent2D actualExtent = {WWIDTH, WHEIGHT};
         actualExtent.width = std::max(
             capabilities.minImageExtent.width,
@@ -1048,6 +1276,60 @@ class TriangleApp {
         f.read(buffer.data(), fSize);
         f.close();
         return buffer;
+    }
+
+    uint32_t findMemoryType(uint32_t typeFilter,
+                            VkMemoryPropertyFlags propertyFlags) {
+        VkPhysicalDeviceMemoryProperties memProperties;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if (typeFilter & (1 << i) &&
+                (memProperties.memoryTypes[i].propertyFlags & propertyFlags) ==
+                    propertyFlags) {
+                return i;
+            }
+        }
+
+        throw std::runtime_error("Failed to find suitable memory type");
+    }
+
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+        VkCommandBufferAllocateInfo mallocInfo{};
+        mallocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        mallocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        mallocInfo.commandPool = commandPool;
+        mallocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &mallocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo bufferBeginInfo{};
+        bufferBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bufferBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        vkBeginCommandBuffer(commandBuffer, &bufferBeginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = 0;
+        copyRegion.size = size;
+
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+        vkEndCommandBuffer(commandBuffer);
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue);
+
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+
+
+
     }
 };
 
